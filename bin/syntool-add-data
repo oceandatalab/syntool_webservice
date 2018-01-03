@@ -1,0 +1,167 @@
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+
+"""
+Copyright (C) 2014-2018 OceanDataLab
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+import os
+import sys
+import json
+import errno
+import shutil
+import tempfile
+import argparse
+import logging
+import traceback
+import ConfigParser
+try:
+    # Use of subprocess32 (backport from Python 3.2) is encouraged by Python
+    # official documentation.
+    # See https://docs.python.org/2/library/subprocess.html
+    import subprocess32 as subprocess
+except ImportError:
+    import subprocess
+import syntool_metadata.db
+
+
+logger = logging.getLogger()
+handler = logging.StreamHandler()
+handler.setLevel(logging.ERROR)
+logger.addHandler(handler)
+logger.setLevel(logging.ERROR)
+
+def parse_cfg_file(cfg_file_path):
+    """"""
+    parser = ConfigParser.SafeConfigParser()
+    parser.read(cfg_file_path)
+
+    cfg = {}
+
+    cfg['db_user'] = parser.get('database', 'user')
+    cfg['db_password'] = parser.get('database', 'password')
+    cfg['db_host'] = parser.get('database', 'host')
+    cfg['db_port'] = parser.get('database', 'port')
+    cfg['db_name'] = parser.get('database', 'name')
+
+    cfg['root_dir'] = parser.get('general', 'root_dir')
+
+    return cfg
+
+if '__main__' == __name__:
+    parser = argparse.ArgumentParser()
+    parser.add_argument( 'input_path'
+                       , type=str
+                       , action='store')
+    parser.add_argument( '-c', '--config'
+                       , required=True
+                       , type=str
+                       , action='store')
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument( '-m', '--meta'
+                      , required=False
+                      , action='store_true')
+
+    args = parser.parse_args()
+
+    # Load config
+    if not os.path.exists(args.config):
+        raise Exception('Could not find database config file: %s' % args.config)
+    cfg = parse_cfg_file(args.config)
+
+    # Prepare database connection
+    db_uri = 'mysql://{db_user}:{db_password}@{db_host}/{db_name}'.format(**cfg)
+    storage_type = syntool_metadata.db.Storage(db_uri)
+    root_dir = cfg.get('root_dir')
+
+    if args.meta is True:
+        with open(args.input_path, 'r') as f:
+            meta = json.load(f)
+    else:
+        # Extract tar content
+        if not args.input_path.endswith('.tar'):
+            raise Exception('syntool-add-data expects a filepath ending with ".tar"')
+
+        if not os.path.exists(args.input_path):
+            raise Exception('Could not find tar archive: {}'.format(args.input_path))
+
+        upload_path=os.path.join(root_dir, 'workspace')
+        if not os.path.exists(upload_path):
+            try:
+                os.makedirs(upload_path)
+            except OSError, e:
+                if e.errno != errno.EEXIST:
+                    raise
+
+        temp_dir = tempfile.mkdtemp(dir=upload_path)
+        call = ['tar', 'xf', args.input_path, '-C', temp_dir]
+        logger.info(str(call))
+        try:
+            subprocess.check_call(call)
+        except subprocess.CalledProcessError as e:
+            logger.error('Could not extract data from tar file {}.'.format(args.input_path))
+            logger.debug(traceback.print_exc())
+            raise
+
+        # Load metadata
+        metadata_path = os.path.join(temp_dir, 'metadata.json')
+        if not os.path.exists(metadata_path):
+            raise Exception('File metadata.json missing from tar archive.')
+
+        with open(metadata_path, 'r') as f:
+            meta = json.load(f)
+
+        # Place files in the data directory
+        syntool_id = meta.get('syntool_id')
+        dataset = meta.get('dataset')
+        data_path = os.path.join(root_dir, 'ingested', syntool_id, dataset)
+
+        if not os.path.exists(data_path):
+            try:
+                os.makedirs(data_path)
+            except IOError, e:
+                if e.errno != errno.EEXIST:
+                    raise
+        files = os.listdir(temp_dir)
+        for file_basename in files:
+            src_path = os.path.join(temp_dir, file_basename)
+            dst_path = os.path.join(data_path, file_basename)
+            if os.path.exists(dst_path):
+                if os.path.isdir(dst_path):
+                    shutil.rmtree(dst_path)
+                else:
+                    os.remove(dst_path)
+            shutil.move(src_path, dst_path)
+
+        # Clean
+        shutil.rmtree(temp_dir)
+        os.remove(args.input_path)
+
+
+    # Update metadata in Syntool database
+    with storage_type.get_session() as storage:
+        logger.info('Inserting dataset in database...')
+
+        syntool_id = meta['syntool_id']
+        output_type = meta['output_type']
+        _, created = storage.create_product(syntool_id, output_type)
+
+        # create dataset
+        storage.create_dataset( syntool_id, meta['dataset']
+                              , meta['begin_datetime'], meta['end_datetime']
+                              , meta['min_zoom_level'], meta['max_zoom_level']
+                              , meta['resolutions'], meta['bbox_str'], meta['shape_str'])
